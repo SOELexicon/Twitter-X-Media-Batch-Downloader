@@ -157,6 +157,104 @@ def get_metadata(username, auth_token, timeline_type="timeline", batch_size=0, p
             else:
                 return {"error": error_str}
 
+def get_tweet_metadata(tweet_id, auth_token, media_type="all"):
+    url = f"https://x.com/i/status/{tweet_id}"
+
+    extractor_class = twitter.TwitterTweetExtractor
+
+    match = re.match(extractor_class.pattern, url)
+    if not match:
+        raise ValueError(f"Invalid tweet URL: {url}")
+
+    extractor = extractor_class(match)
+
+    config_dict = {
+        "cookies": {
+            "auth_token": auth_token
+        }
+    }
+
+    extractor.config = lambda key, default=None: config_dict.get(key, default)
+
+    try:
+        extractor.initialize()
+
+        structured_output = {
+            'account_info': {},
+            'total_urls': 0,
+            'timeline': [],
+            'tweet_id': tweet_id
+        }
+
+        iterator = iter(extractor)
+
+        try:
+            for item in iterator:
+                if isinstance(item, tuple) and len(item) >= 3:
+                    media_url = item[1]
+                    tweet_data = item[2]
+
+                    if not structured_output['account_info'] and 'user' in tweet_data:
+                        user = tweet_data['user']
+                        user_date = user.get('date', '')
+                        if isinstance(user_date, datetime):
+                            user_date = user_date.strftime("%Y-%m-%d %H:%M:%S")
+
+                        structured_output['account_info'] = {
+                            'name': user.get('name', ''),
+                            'nick': user.get('nick', ''),
+                            'date': user_date,
+                            'followers_count': user.get('followers_count', 0),
+                            'friends_count': user.get('friends_count', 0),
+                            'profile_image': user.get('profile_image', ''),
+                            'statuses_count': user.get('statuses_count', 0)
+                        }
+
+                    if 'pbs.twimg.com' in media_url or 'video.twimg.com' in media_url:
+                        tweet_date = tweet_data.get('date', datetime.now())
+                        if isinstance(tweet_date, datetime):
+                            tweet_date = tweet_date.strftime("%Y-%m-%d %H:%M:%S")
+
+                        timeline_entry = {
+                            'url': media_url,
+                            'date': tweet_date,
+                            'tweet_id': tweet_data.get('tweet_id', 0),
+                        }
+
+                        if 'type' in tweet_data:
+                            timeline_entry['type'] = tweet_data['type']
+
+                        if media_type == 'all' or (
+                            (media_type == 'image' and 'pbs.twimg.com' in media_url and tweet_data.get('type') == 'photo') or
+                            (media_type == 'video' and 'video.twimg.com' in media_url and tweet_data.get('type') == 'video') or
+                            (media_type == 'gif' and 'video.twimg.com' in media_url and tweet_data.get('type') == 'animated_gif')
+                        ):
+                            structured_output['timeline'].append(timeline_entry)
+                            structured_output['total_urls'] += 1
+        except StopIteration:
+            pass
+
+        structured_output['metadata'] = {
+            "is_tweet": True,
+            "tweet_id": tweet_id
+        }
+
+        if not structured_output['account_info']:
+            raise ValueError("Failed to fetch tweet information. Please check the tweet ID and auth token.")
+
+        return structured_output
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "withheld" in error_msg or e.__class__.__name__ == "ValueError" and str(e) == "withheld":
+            return {"error": "This tweet is withheld and cannot be accessed."}
+        else:
+            error_str = str(e)
+            if error_str == "None":
+                return {"error": "Failed to authenticate. Please verify your auth token is valid and not expired."}
+            else:
+                return {"error": error_str}
+
 def main():
     username = ""
     auth_token = ""
@@ -164,7 +262,7 @@ def main():
     batch_size = 100
     page = 0
     media_type = "all"
-    
+
     try:
         data = get_metadata(
             username=username,
