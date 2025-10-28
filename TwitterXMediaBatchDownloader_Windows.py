@@ -21,7 +21,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer, QTime, QSettings
 from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
 from PyQt6.QtGui import QIcon, QTextCursor, QDesktopServices, QPixmap, QPainter, QPainterPath
 from PyQt6.QtSvg import QSvgRenderer
-from getMetadata import get_metadata
+from getMetadata import get_metadata, get_tweet_metadata
 
 @dataclass
 class Account:
@@ -33,8 +33,9 @@ class Account:
     media_type: str
     profile_image: str = None
     media_list: list = None
-    fetch_mode: str = 'all'  
-    fetch_timestamp: str = None  
+    fetch_mode: str = 'all'
+    fetch_timestamp: str = None
+    tweet_id: str = None  
 
 class MetadataFetchWorker(QThread):
     finished = pyqtSignal(dict)
@@ -52,29 +53,63 @@ class MetadataFetchWorker(QThread):
     def normalize_url(self, url_or_username):
         url_or_username = url_or_username.strip()
         username = url_or_username
-        
+        tweet_id = None
+        is_tweet_url = False
+
         if "x.com/" in url_or_username or "twitter.com/" in url_or_username:
-            parts = url_or_username.split('/')
-            for i, part in enumerate(parts):
-                if part in ['x.com', 'twitter.com'] and i + 1 < len(parts):
-                    username = parts[i + 1]
-                    username = username.split('/')[0]
-                    break
-        
-        username = username.strip()
-        return username
+            # Check if it's a status/tweet URL
+            if "/status/" in url_or_username or "/i/status/" in url_or_username:
+                is_tweet_url = True
+                parts = url_or_username.split('/')
+                # Extract tweet ID from the URL
+                for i, part in enumerate(parts):
+                    if part in ['status'] and i + 1 < len(parts):
+                        tweet_id = parts[i + 1].split('?')[0]  # Remove query params
+                        break
+                # Try to extract username if it's not /i/status/ format
+                if "/i/status/" not in url_or_username:
+                    for i, part in enumerate(parts):
+                        if part in ['x.com', 'twitter.com'] and i + 1 < len(parts):
+                            potential_username = parts[i + 1]
+                            if potential_username not in ['i', 'status']:
+                                username = potential_username
+                                break
+                else:
+                    username = None  # Will be extracted from tweet metadata
+            else:
+                # Regular profile URL
+                parts = url_or_username.split('/')
+                for i, part in enumerate(parts):
+                    if part in ['x.com', 'twitter.com'] and i + 1 < len(parts):
+                        username = parts[i + 1]
+                        username = username.split('/')[0]
+                        break
+
+        if username:
+            username = username.strip()
+        return username, tweet_id, is_tweet_url
         
     def run(self):
         try:
-            normalized = self.normalize_url(self.username)
-            data = get_metadata(
-                username=normalized,
-                auth_token=self.auth_token,
-                timeline_type='media',
-                batch_size=self.batch_size if self.batch_mode else 0,
-                page=self.page,
-                media_type=self.media_type
-            )
+            username, tweet_id, is_tweet_url = self.normalize_url(self.username)
+
+            if is_tweet_url and tweet_id:
+                # Fetch individual tweet metadata
+                data = get_tweet_metadata(
+                    tweet_id=tweet_id,
+                    auth_token=self.auth_token,
+                    media_type=self.media_type
+                )
+            else:
+                # Fetch user timeline metadata
+                data = get_metadata(
+                    username=username,
+                    auth_token=self.auth_token,
+                    timeline_type='media',
+                    batch_size=self.batch_size if self.batch_mode else 0,
+                    page=self.page,
+                    media_type=self.media_type
+                )
             self.finished.emit(data)
         except Exception as e:
             self.error.emit(str(e))
@@ -86,7 +121,8 @@ class DownloadWorker(QThread):
     download_progress = pyqtSignal(str, int)
     
     def __init__(self, accounts, outpath, auth_token, filename_format='username_date',
-                 download_batch_size=25, convert_gif=False, gif_resolution='original', gif_conversion_mode='better'):
+                 download_batch_size=25, convert_gif=False, gif_resolution='original', gif_conversion_mode='better',
+                 use_subfolders=False):
         super().__init__()
         self.accounts = accounts
         self.outpath = outpath
@@ -96,6 +132,7 @@ class DownloadWorker(QThread):
         self.convert_gif = convert_gif
         self.gif_resolution = gif_resolution
         self.gif_conversion_mode = gif_conversion_mode
+        self.use_subfolders = use_subfolders
         self.is_paused = False
         self.is_stopped = False
         self.filepath_map = []
@@ -121,8 +158,12 @@ class DownloadWorker(QThread):
     async def download_account_media(self, account):
         if not account.media_list:
             return 0, 0, 0
-            
-        account_output_dir = os.path.join(self.outpath, account.username)
+
+        # Create account subfolder only if use_subfolders is enabled
+        if self.use_subfolders:
+            account_output_dir = os.path.join(self.outpath, account.username)
+        else:
+            account_output_dir = self.outpath
         os.makedirs(account_output_dir, exist_ok=True)        
         timeout = aiohttp.ClientTimeout(total=30)
         connector = aiohttp.TCPConnector(limit=self.download_batch_size)
@@ -163,7 +204,12 @@ class DownloadWorker(QThread):
                     else:
                         media_type_folder = 'image'
                         extension = 'jpg'
-                    media_output_dir = os.path.join(account_output_dir, media_type_folder)
+
+                    # Create media type subfolder only if use_subfolders is enabled
+                    if self.use_subfolders:
+                        media_output_dir = os.path.join(account_output_dir, media_type_folder)
+                    else:
+                        media_output_dir = account_output_dir
                     
                     if self.filename_format == "username_date":
                         base_filename = f"{account.username}_{formatted_date}_{tweet_id}"
@@ -362,7 +408,8 @@ class TwitterMediaDownloaderGUI(QWidget):
         self.last_url = self.settings.value('twitter_url', '')
         self.last_auth_token = self.settings.value('auth_token', '')
         self.filename_format = self.settings.value('filename_format', 'username_date')
-        self.download_batch_size = self.settings.value('download_batch_size', 25, type=int)        
+        self.download_batch_size = self.settings.value('download_batch_size', 25, type=int)
+        self.use_subfolders = self.settings.value('use_subfolders', False, type=bool)
         self.batch_mode = self.settings.value('batch_mode', False, type=bool)
         self.batch_size = self.settings.value('batch_size', 100, type=int)
         self.timeline_type = self.settings.value('timeline_type', 'media')
@@ -489,7 +536,7 @@ class TwitterMediaDownloaderGUI(QWidget):
         twitter_label.setFixedWidth(100)
         
         self.twitter_url = QLineEdit()
-        self.twitter_url.setPlaceholderText("e.g. Takomayuyi or https://x.com/Takomayuyi or user1,user2,user3")
+        self.twitter_url.setPlaceholderText("e.g. username, https://x.com/username, https://x.com/i/status/123456, or user1,user2,user3")
         self.twitter_url.setClearButtonEnabled(True)
         self.twitter_url.setText(self.last_url)
         self.twitter_url.textChanged.connect(self.save_url)        
@@ -555,34 +602,37 @@ class TwitterMediaDownloaderGUI(QWidget):
     def setup_account_buttons(self):
         self.btn_layout = QHBoxLayout()
         self.import_btn = QPushButton(' Import')
+        self.import_urls_btn = QPushButton(' Import URLs')
         self.export_btn = QPushButton(' Export')
         self.download_selected_btn = QPushButton(' Download')
         self.update_selected_btn = QPushButton(' Update')
         self.delete_btn = QPushButton(' Delete')
-        
+
         icon_dir = os.path.join(os.path.dirname(__file__), 'icons')
         accent_color = self.current_theme_color
-        
+
         self.import_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'database-import.svg'), accent_color))
+        self.import_urls_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'database-import.svg'), accent_color))
         self.export_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'database-export.svg'), accent_color))
         self.download_selected_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'download.svg'), accent_color))
         self.update_selected_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'reload.svg'), accent_color))
         self.delete_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'trash.svg'), accent_color))
-        
-        for btn in [self.import_btn, self.export_btn, self.download_selected_btn, 
+
+        for btn in [self.import_btn, self.import_urls_btn, self.export_btn, self.download_selected_btn,
                     self.update_selected_btn, self.delete_btn]:
             btn.setMinimumWidth(100)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setIconSize(QSize(18, 18))
-            
+
         self.import_btn.clicked.connect(self.import_accounts)
+        self.import_urls_btn.clicked.connect(self.import_urls)
         self.export_btn.clicked.connect(self.export_accounts)
         self.download_selected_btn.clicked.connect(self.download_selected)
         self.update_selected_btn.clicked.connect(self.update_selected)
         self.delete_btn.clicked.connect(self.delete_accounts)
-        
+
         self.btn_layout.addStretch()
-        for btn in [self.import_btn, self.export_btn, self.download_selected_btn, 
+        for btn in [self.import_btn, self.import_urls_btn, self.export_btn, self.download_selected_btn,
                     self.update_selected_btn, self.delete_btn]:
             self.btn_layout.addWidget(btn, 1)
         self.btn_layout.addStretch()
@@ -590,11 +640,12 @@ class TwitterMediaDownloaderGUI(QWidget):
     def update_button_icons(self):
         if not hasattr(self, 'import_btn'):
             return
-        
+
         icon_dir = os.path.join(os.path.dirname(__file__), 'icons')
         accent_color = self.current_theme_color
-        
+
         self.import_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'database-import.svg'), accent_color))
+        self.import_urls_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'database-import.svg'), accent_color))
         self.export_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'database-export.svg'), accent_color))
         self.download_selected_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'download.svg'), accent_color))
         self.update_selected_btn.setIcon(self.create_colored_icon(os.path.join(icon_dir, 'reload.svg'), accent_color))
@@ -839,9 +890,17 @@ class TwitterMediaDownloaderGUI(QWidget):
         self.download_batch_combo.setCurrentText(str(self.download_batch_size))
         self.download_batch_combo.currentTextChanged.connect(self.save_settings)
         download_controls_layout.addWidget(self.download_batch_combo)
+
+        self.use_subfolders_checkbox = QCheckBox("Subfolders")
+        self.use_subfolders_checkbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.use_subfolders_checkbox.setToolTip("Organize files into username/media_type folders")
+        self.use_subfolders_checkbox.setChecked(self.use_subfolders)
+        self.use_subfolders_checkbox.toggled.connect(self.save_settings)
+        download_controls_layout.addWidget(self.use_subfolders_checkbox)
+
         download_controls_layout.addStretch()
-        
-        download_controls_container.setFixedWidth(180)
+
+        download_controls_container.setFixedWidth(250)
         controls_layout.addWidget(download_controls_container)
         
         self.convert_gif_checkbox = QCheckBox("Convert GIF")
@@ -1062,13 +1121,10 @@ class TwitterMediaDownloaderGUI(QWidget):
                 }}
             """)
         
-        qdarktheme.setup_theme(
-            custom_colors={
-                "[dark]": {
-                    "primary": color,
-                }
-            }
-        )
+        # Apply dark theme stylesheet
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(qdarktheme.load_stylesheet())
         
         self.update_button_icons()
         
@@ -1127,7 +1183,11 @@ class TwitterMediaDownloaderGUI(QWidget):
         if hasattr(self, 'convert_gif_checkbox'):
             self.settings.setValue('convert_gif', self.convert_gif_checkbox.isChecked())
             self.convert_gif = self.convert_gif_checkbox.isChecked()
-        
+
+        if hasattr(self, 'use_subfolders_checkbox'):
+            self.settings.setValue('use_subfolders', self.use_subfolders_checkbox.isChecked())
+            self.use_subfolders = self.use_subfolders_checkbox.isChecked()
+
         if hasattr(self, 'conversion_mode_combo'):
             self.settings.setValue('gif_conversion_mode', self.conversion_mode_combo.currentData())
             self.gif_conversion_mode = self.conversion_mode_combo.currentData()
@@ -1201,7 +1261,13 @@ class TwitterMediaDownloaderGUI(QWidget):
                         self.quality_label.hide()
                     if hasattr(self, 'conversion_quality_combo'):
                         self.conversion_quality_combo.hide()
-            
+
+            use_subfolders = self.settings.value('use_subfolders', False, type=bool)
+            if hasattr(self, 'use_subfolders_checkbox'):
+                self.use_subfolders_checkbox.blockSignals(True)
+                self.use_subfolders_checkbox.setChecked(use_subfolders)
+                self.use_subfolders_checkbox.blockSignals(False)
+
             gif_conversion_mode = self.settings.value('gif_conversion_mode', 'better')
             if hasattr(self, 'conversion_mode_combo'):
                 for i in range(self.conversion_mode_combo.count()):
@@ -1387,11 +1453,11 @@ class TwitterMediaDownloaderGUI(QWidget):
             
             self.accounts_to_fetch = []
             media_type = self.media_type_combo.currentData()
-            
+
             for url in urls:
-                username = self.normalize_url_to_username(url)
-                if username:
-                    self.accounts_to_fetch.append((username, media_type))
+                username, tweet_id, is_tweet_url = self.normalize_url_to_username(url)
+                if username or tweet_id:
+                    self.accounts_to_fetch.append((username if username else url, media_type, tweet_id))
             
             if self.accounts_to_fetch:
                 self.current_fetch_index = 0
@@ -1417,8 +1483,8 @@ class TwitterMediaDownloaderGUI(QWidget):
             return
         
         url = urls[0]
-        username = self.normalize_url_to_username(url)
-        if not username:
+        username, tweet_id, is_tweet_url = self.normalize_url_to_username(url)
+        if not username and not tweet_id:
             self.log_output.append('Warning: Invalid username/URL format.')
             return
 
@@ -1479,29 +1545,31 @@ class TwitterMediaDownloaderGUI(QWidget):
 
         try:
             self.reset_ui()
-            
+
             self.is_auto_fetching = False
             self.is_multiple_user_mode = False
-            self.current_fetch_username = username
+            self.current_fetch_username = username if username else url
             self.current_fetch_media_type = media_type
-            
+            self.current_fetch_tweet_id = tweet_id
+
             self.disable_batch_buttons()
-            
-            self.log_output.append(f'Fetching metadata for {username}...')
+
+            display_name = f"tweet {tweet_id}" if tweet_id else username
+            self.log_output.append(f'Fetching metadata for {display_name}...')
             self.tab_widget.setCurrentWidget(self.process_tab)
-            
+
             self.cancel_fetch_btn.show()
-            
+
             self.metadata_worker = MetadataFetchWorker(
-                username, 
-                media_type, 
+                url if is_tweet_url else username,
+                media_type,
                 batch_mode=self.batch_mode,
                 batch_size=self.batch_size if self.batch_mode else 0,
                 page=0
             )
             self.metadata_worker.auth_token = self.auth_token_input.text().strip()
-            self.metadata_worker.finished.connect(lambda data: self.on_metadata_fetched(data, username, media_type))
-            self.metadata_worker.error.connect(self.on_metadata_error)            
+            self.metadata_worker.finished.connect(lambda data: self.on_metadata_fetched(data, username if username else url, media_type, tweet_id))
+            self.metadata_worker.error.connect(self.on_metadata_error)
             self.metadata_worker.start()
             
         except Exception as e:            
@@ -1511,17 +1579,41 @@ class TwitterMediaDownloaderGUI(QWidget):
     def normalize_url_to_username(self, url_or_username):
         url_or_username = url_or_username.strip()
         username = url_or_username
-        
+        tweet_id = None
+        is_tweet_url = False
+
         if "x.com/" in url_or_username or "twitter.com/" in url_or_username:
-            parts = url_or_username.split('/')
-            for i, part in enumerate(parts):
-                if part in ['x.com', 'twitter.com'] and i + 1 < len(parts):
-                    username = parts[i + 1]
-                    username = username.split('/')[0]
-                    break
-        
-        username = username.strip()
-        return username if username else None
+            # Check if it's a status/tweet URL
+            if "/status/" in url_or_username or "/i/status/" in url_or_username:
+                is_tweet_url = True
+                parts = url_or_username.split('/')
+                # Extract tweet ID from the URL
+                for i, part in enumerate(parts):
+                    if part in ['status'] and i + 1 < len(parts):
+                        tweet_id = parts[i + 1].split('?')[0]  # Remove query params
+                        break
+                # Try to extract username if it's not /i/status/ format
+                if "/i/status/" not in url_or_username:
+                    for i, part in enumerate(parts):
+                        if part in ['x.com', 'twitter.com'] and i + 1 < len(parts):
+                            potential_username = parts[i + 1]
+                            if potential_username not in ['i', 'status']:
+                                username = potential_username
+                                break
+                else:
+                    username = None  # Will be extracted from tweet metadata
+            else:
+                # Regular profile URL
+                parts = url_or_username.split('/')
+                for i, part in enumerate(parts):
+                    if part in ['x.com', 'twitter.com'] and i + 1 < len(parts):
+                        username = parts[i + 1]
+                        username = username.split('/')[0]
+                        break
+
+        if username:
+            username = username.strip()
+        return username if username else None, tweet_id, is_tweet_url
     
     def fetch_next_account_in_batch(self):
 
@@ -1561,8 +1653,9 @@ class TwitterMediaDownloaderGUI(QWidget):
             self.tab_widget.setCurrentIndex(0)
             return
         
-        username, media_type = self.accounts_to_fetch[self.current_fetch_index]
-        self.log_output.append(f'Processing account {self.current_fetch_index + 1}/{len(self.accounts_to_fetch)}: {username} ({media_type})')
+        username, media_type, tweet_id = self.accounts_to_fetch[self.current_fetch_index]
+        display_name = f"tweet {tweet_id}" if tweet_id else username
+        self.log_output.append(f'Processing account {self.current_fetch_index + 1}/{len(self.accounts_to_fetch)}: {display_name} ({media_type})')
         
         existing_account = None
         for account in self.accounts:
@@ -1646,19 +1739,20 @@ class TwitterMediaDownloaderGUI(QWidget):
             
             self.current_fetch_username = username
             self.current_fetch_media_type = media_type
-            
+            self.current_fetch_tweet_id = tweet_id
+
             self.disable_batch_buttons()
-            
+
             self.metadata_worker = MetadataFetchWorker(
-                username, 
-                media_type, 
+                username,
+                media_type,
                 batch_mode=self.batch_mode,
                 batch_size=self.batch_size if self.batch_mode else 0,
                 page=0
             )
             self.metadata_worker.auth_token = self.auth_token_input.text().strip()
-            self.metadata_worker.finished.connect(lambda data: self.on_batch_metadata_fetched(data, username, media_type))
-            self.metadata_worker.error.connect(self.on_batch_metadata_error)            
+            self.metadata_worker.finished.connect(lambda data: self.on_batch_metadata_fetched(data, username, media_type, tweet_id))
+            self.metadata_worker.error.connect(self.on_batch_metadata_error)
             self.metadata_worker.start()
             
         except Exception as e:            
@@ -1666,36 +1760,58 @@ class TwitterMediaDownloaderGUI(QWidget):
             self.current_fetch_index += 1
             self.fetch_next_account_in_batch()
     
-    def on_batch_metadata_fetched(self, data, username, media_type):
+    def on_batch_metadata_fetched(self, data, username, media_type, tweet_id=None):
         try:
+            display_name = f"tweet {tweet_id}" if tweet_id else username
+
             if hasattr(self, 'is_multiple_user_mode') and self.is_multiple_user_mode and not self.is_auto_fetching:
-                self.log_output.append(f'Ignoring result for {username} - auto-fetch was stopped.')
+                self.log_output.append(f'Ignoring result for {display_name} - auto-fetch was stopped.')
                 return
-            
-            if 'error' in data:
-                self.log_output.append(f'Error fetching {username}: {data["error"]}')
-                if self.is_auto_fetching:
-                    self.current_fetch_index += 1
-                    self.fetch_next_account_in_batch()
+
+            # Use the main on_metadata_fetched method to handle the data processing
+            self.on_metadata_fetched(data, username, media_type, tweet_id)
+
+            # Check if there was an error
+            if 'error' in data or not data.get('timeline'):
+                self.current_fetch_index += 1
+                self.fetch_next_account_in_batch()
                 return
-                
-            account_info = data.get('account_info', {})
-            timeline = data.get('timeline', [])
+
+            # Continue with batch processing logic
             metadata = data.get('metadata', {})
-            
-            if not account_info:
-                self.log_output.append(f'Error: Invalid account data received for {username}')
-                self.current_fetch_index += 1
-                self.fetch_next_account_in_batch()
+            existing_account = None
+            for account in self.accounts:
+                if tweet_id:
+                    actual_username = data.get('account_info', {}).get('name', username)
+                    display_username = f"{actual_username}_tweet_{tweet_id}"
+                    if account.username == display_username and account.media_type == media_type and account.tweet_id == tweet_id:
+                        existing_account = account
+                        break
+                else:
+                    if account.username == username and account.media_type == media_type and account.tweet_id is None:
+                        existing_account = account
+                        break
+
+            # For batch mode with more pages
+            if existing_account and self.batch_mode and metadata.get('has_more', False):
+                current_page = metadata.get('page', 0)
+                next_page = current_page + 1
+                self.log_output.append(f'Batch {current_page + 1} completed for {display_name}. Next batch ({next_page + 1}) available.')
+                self.fetch_next_batch_for_current_user(username, media_type, next_page, metadata, tweet_id=tweet_id)
                 return
-            
-            if not timeline:
-                media_type_display = media_type if media_type != 'all' else 'media'
-                self.log_output.append(f'Warning: No {media_type_display} found for account {username}')
-                self.current_fetch_index += 1
-                self.fetch_next_account_in_batch()
-                return
-            
+
+            # Move to next account
+            self.current_fetch_index += 1
+            self.log_output.append(f'Completed processing {display_name}. Moving to next account.')
+            self.fetch_next_account_in_batch()
+
+        except Exception as e:
+            self.log_output.append(f'Error processing metadata for {username}: {str(e)}')
+            self.current_fetch_index += 1
+            self.fetch_next_account_in_batch()
+
+    def on_batch_metadata_fetched_old(self, data, username, media_type):
+        try:
             existing_account = None
             for account in self.accounts:
                 if account.username == username and account.media_type == media_type:
@@ -1837,8 +1953,9 @@ class TwitterMediaDownloaderGUI(QWidget):
     
     def on_batch_metadata_error(self, error_message):
         if hasattr(self, 'accounts_to_fetch') and hasattr(self, 'current_fetch_index'):
-            username, media_type = self.accounts_to_fetch[self.current_fetch_index]
-            self.log_output.append(f'Error fetching {username}: {error_message}')
+            username, media_type, tweet_id = self.accounts_to_fetch[self.current_fetch_index]
+            display_name = f"tweet {tweet_id}" if tweet_id else username
+            self.log_output.append(f'Error fetching {display_name}: {error_message}')
             
             if hasattr(self, 'is_multiple_user_mode') and self.is_multiple_user_mode and not self.is_auto_fetching:
                 self.log_output.append('Auto-fetch stopped by user. Error handling halted.')
@@ -1854,47 +1971,69 @@ class TwitterMediaDownloaderGUI(QWidget):
         else:
             self.on_metadata_error(error_message)
         
-    def on_metadata_fetched(self, data, username, media_type):
+    def on_metadata_fetched(self, data, username, media_type, tweet_id=None):
         try:
             if 'error' in data:
                 self.log_output.append(f'Error: {data["error"]}')
                 self.update_account_list()
                 return
-                
+
             account_info = data.get('account_info', {})
             timeline = data.get('timeline', [])
             metadata = data.get('metadata', {})
+            is_tweet = metadata.get('is_tweet', False) or tweet_id is not None
+
             if not account_info:
                 self.log_output.append('Error: Invalid account data received')
                 self.update_account_list()
                 return
-            
+
             if not timeline:
                 media_type_display = media_type if media_type != 'all' else 'media'
-                self.log_output.append(f'Error: No {media_type_display} found for account {username}')
+                display_name = f"tweet {tweet_id}" if tweet_id else username
+                self.log_output.append(f'Error: No {media_type_display} found for {display_name}')
                 self.update_account_list()
                 return
+
+            # For tweet URLs, get the actual username from account_info and create unique identifier
+            if is_tweet:
+                actual_username = account_info.get('name', username)
+                if not tweet_id:
+                    tweet_id = data.get('tweet_id') or metadata.get('tweet_id')
+                # Create unique username for this tweet
+                display_username = f"{actual_username}_tweet_{tweet_id}"
+            else:
+                actual_username = username
+                display_username = username
+
             existing_account = None
             for account in self.accounts:
-                if account.username == username and account.media_type == media_type:
-                    existing_account = account
-                    break
-            
+                if is_tweet:
+                    # For tweets, match by both username and tweet_id
+                    if account.username == display_username and account.media_type == media_type and account.tweet_id == tweet_id:
+                        existing_account = account
+                        break
+                else:
+                    # For regular accounts, match by username only
+                    if account.username == username and account.media_type == media_type and account.tweet_id is None:
+                        existing_account = account
+                        break
+
             if existing_account:
                 existing_account.media_list.extend(timeline)
                 new_items = len(timeline)
                 total_items = len(existing_account.media_list)
-                self.log_output.append(f'Added {new_items:,} items. Total: {total_items:,} media items for {username}')
+                self.log_output.append(f'Added {new_items:,} items. Total: {total_items:,} media items for {display_username}')
             else:
                 followers = account_info.get('followers_count', 0)
                 following = account_info.get('friends_count', 0)
                 posts = account_info.get('statuses_count', 0)
                 nick = account_info.get('nick', account_info.get('name', ''))
                 profile_image_url = account_info.get('profile_image', '')
-                
+
                 account = Account(
-                    username=username,
-                    nick=nick,
+                    username=display_username,
+                    nick=nick if not is_tweet else f"{nick} (Tweet {tweet_id})",
                     followers=followers,
                     following=following,
                     posts=posts,
@@ -1902,11 +2041,15 @@ class TwitterMediaDownloaderGUI(QWidget):
                     profile_image=profile_image_url,
                     media_list=timeline,
                     fetch_mode='batch' if self.batch_mode else 'all',
-                    fetch_timestamp=datetime.now().isoformat()
+                    fetch_timestamp=datetime.now().isoformat(),
+                    tweet_id=tweet_id if is_tweet else None
                 )
-                
+
                 self.accounts.append(account)
-                self.log_output.append(f'Successfully fetched: {username} - Followers: {followers:,} - Posts: {posts:,} • {media_type.title()}')
+                if is_tweet:
+                    self.log_output.append(f'Successfully fetched tweet {tweet_id} from {actual_username} • {media_type.title()}')
+                else:
+                    self.log_output.append(f'Successfully fetched: {username} - Followers: {followers:,} - Posts: {posts:,} • {media_type.title()}')
                 existing_account = account
             
             updated_data = {
@@ -1914,15 +2057,18 @@ class TwitterMediaDownloaderGUI(QWidget):
                 'timeline': existing_account.media_list,
                 'metadata': metadata,
                 'is_batch': self.batch_mode,
-                'fetch_timestamp': existing_account.fetch_timestamp
+                'fetch_timestamp': existing_account.fetch_timestamp,
+                'tweet_id': tweet_id if is_tweet else None
             }
-            self.save_cached_data(username, media_type, updated_data, is_batch=self.batch_mode)
-            
+            self.save_cached_data(display_username, media_type, updated_data, is_batch=self.batch_mode)
+
             self.update_account_list()
-            
-            self.current_fetch_username = username
+
+            self.current_fetch_username = display_username
             self.current_fetch_media_type = media_type
             self.current_fetch_metadata = metadata
+            if is_tweet:
+                self.current_fetch_tweet_id = tweet_id
             
             if self.batch_mode and metadata.get('has_more', False):
                 current_page = metadata.get('page', 0)
@@ -1946,13 +2092,19 @@ class TwitterMediaDownloaderGUI(QWidget):
                 self.auto_batch_btn.hide()
                 self.stop_fetch_btn.hide()
                 self.cancel_fetch_btn.hide()
-                self.is_auto_fetching = False
-                
+
+                # Only reset auto_fetching flag if we're NOT in multiple user mode
+                # In multiple user mode, let on_batch_metadata_fetched handle the flag
+                if not (hasattr(self, 'is_multiple_user_mode') and self.is_multiple_user_mode):
+                    self.is_auto_fetching = False
+
                 if self.batch_mode:
                     total_items = len(existing_account.media_list)
                     self.log_output.append(f'All batches complete! Total: {total_items:,} media items for {username}')
-                
-                self.twitter_url.clear()
+
+                # Only clear input if NOT in multiple user mode
+                if not (hasattr(self, 'is_multiple_user_mode') and self.is_multiple_user_mode):
+                    self.twitter_url.clear()
                 
                 if hasattr(self, 'accounts_to_update') and hasattr(self, 'current_update_index'):
                     self.current_update_index += 1
@@ -2292,14 +2444,15 @@ class TwitterMediaDownloaderGUI(QWidget):
 
     def start_download_worker(self, accounts_to_download, outpath):
         self.worker = DownloadWorker(
-            accounts_to_download, 
-            outpath, 
+            accounts_to_download,
+            outpath,
             self.auth_token_input.text().strip(),
             self.filename_format,
             self.download_batch_size,
             self.convert_gif,
             self.gif_conversion_quality,
-            self.gif_conversion_mode
+            self.gif_conversion_mode,
+            self.use_subfolders
         )
         self.worker.finished.connect(self.on_download_finished)
         self.worker.progress.connect(self.update_progress)
@@ -2637,6 +2790,91 @@ class TwitterMediaDownloaderGUI(QWidget):
         self.log_output.append(f'Import completed: {imported_count} imported, {skipped_count} skipped, {error_count} errors')
         self.tab_widget.setCurrentIndex(0)
 
+    def import_urls(self):
+        """Import URLs from .txt or .json files"""
+        self.tab_widget.setCurrentIndex(1)
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select URL File to Import",
+            self.last_output_path,
+            "URL Files (*.txt *.json);;Text Files (*.txt);;JSON Files (*.json);;All Files (*.*)"
+        )
+
+        if not file_path:
+            self.log_output.append('URL import cancelled')
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            urls = []
+
+            # Try parsing as JSON first
+            if file_path.endswith('.json'):
+                try:
+                    json_data = json.loads(content)
+                    if isinstance(json_data, list):
+                        urls = [str(url).strip() for url in json_data if url]
+                    else:
+                        self.log_output.append('Error: JSON file must contain an array of URLs')
+                        return
+                except json.JSONDecodeError:
+                    self.log_output.append('Error: Invalid JSON format')
+                    return
+            else:
+                # Parse as text file (one URL per line)
+                urls = [line.strip() for line in content.splitlines() if line.strip()]
+
+            if not urls:
+                self.log_output.append('Error: No URLs found in file')
+                return
+
+            self.log_output.append(f'Found {len(urls)} URLs in file. Starting import...')
+
+            # Get media type from settings
+            media_type = self.media_type_combo.currentData()
+
+            # Set up batch processing
+            self.accounts_to_fetch = []
+            for url in urls:
+                username, tweet_id, is_tweet_url = self.normalize_url_to_username(url)
+                if username or tweet_id:
+                    self.accounts_to_fetch.append((username if username else url, media_type, tweet_id))
+                else:
+                    self.log_output.append(f'Skipped invalid URL: {url}')
+
+            if not self.accounts_to_fetch:
+                self.log_output.append('Error: No valid URLs found')
+                return
+
+            self.log_output.append(f'Prepared {len(self.accounts_to_fetch)} URLs for fetching')
+            self.current_fetch_index = 0
+            self.is_multiple_user_mode = True
+            self.is_initial_fetch = True
+
+            if self.batch_mode:
+                self.is_auto_fetching = True
+                self.auto_batch_btn.hide()
+                self.next_batch_btn.hide()
+                self.cancel_fetch_btn.hide()
+                self.stop_fetch_btn.show()
+                self.log_output.append('Auto-fetching all URLs in batch mode...')
+            else:
+                self.is_auto_fetching = True
+                self.auto_batch_btn.hide()
+                self.next_batch_btn.hide()
+                self.cancel_fetch_btn.hide()
+                self.stop_fetch_btn.show()
+                self.log_output.append('Auto-fetching all URLs...')
+
+            self.fetch_next_account_in_batch()
+
+        except Exception as e:
+            self.log_output.append(f'Error importing URLs: {str(e)}')
+            self.tab_widget.setCurrentIndex(0)
+
     def update_timer(self):
         self.elapsed_time = self.elapsed_time.addSecs(1)
         self.time_label.setText(self.elapsed_time.toString("hh:mm:ss"))
@@ -2787,13 +3025,8 @@ def main():
     settings = QSettings('TwitterMediaDownloader', 'Settings')
     theme_color = settings.value('theme_color', '#2196F3')
     
-    qdarktheme.setup_theme(
-        custom_colors={
-            "[dark]": {
-                "primary": theme_color,
-            }
-        }
-    )
+    # Apply dark theme stylesheet
+    app.setStyleSheet(qdarktheme.load_stylesheet())
     window = TwitterMediaDownloaderGUI()
     window.show()
     sys.exit(app.exec())
